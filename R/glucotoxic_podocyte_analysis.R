@@ -54,8 +54,10 @@ counts <- read.csv("data/GSE307956_raw_count_matrix.csv",
 # Map sample labels (H/M/N) to the biological condition levels
 lv <- c("N" = "Normal", "M" = "Medium", "H" = "High")
 lab <- substr(gsub("read_count_", "", colnames(counts)), 1, 1)
+# High glucose is the reference level so that contrasts are expressed as
+# Medium-vs-High and Normal-vs-High (matching the manuscript direction).
 col_data <- data.frame(
-  condition = factor(lv[lab], levels = c("Normal", "Medium", "High")),
+  condition = factor(lv[lab], levels = c("High", "Medium", "Normal")),
   row.names = colnames(counts)
 )
 stopifnot(ncol(counts) == 9, all(!is.na(col_data$condition)))
@@ -80,6 +82,8 @@ p_pca <- ggplot(pca_data, aes(PC1, PC2, color = condition)) +
                                 "Normal" = "steelblue")) +
   ggtitle("PCA of VST-normalised Counts — Glucotoxic Podocyte Dataset")
 ggsave("figures/01_QC/PCA_plot.jpeg", p_pca, width = 6, height = 4.5, dpi = 200)
+pca_data$condition <- as.character(pca_data$condition)
+write.csv(pca_data, "data/csv/PCA_coordinates.csv", row.names = FALSE)
 
 # Figure 1B: Sample-Distance Heatmap
 sampleDists <- dist(t(assay(vsd)))
@@ -96,10 +100,10 @@ pheatmap(sampleDistMatrix,
 # ------------------------------------------------------------------------------
 dds <- DESeq(dds)
 
-# Contrast 1: Medium vs High glucose
-res_MH <- lfcShrink(dds, contrast = c("condition", "Medium", "High"), type = "apeglm")
+# Contrast 1: Medium vs High glucose (apeglm requires a model coefficient)
+res_MH <- lfcShrink(dds, coef = "condition_Medium_vs_High", type = "apeglm")
 # Contrast 2: Normal vs High glucose
-res_NH <- lfcShrink(dds, contrast = c("condition", "Normal", "High"), type = "apeglm")
+res_NH <- lfcShrink(dds, coef = "condition_Normal_vs_High", type = "apeglm")
 
 # MA plots
 for (nm in list(list(res_MH, "Medium_vs_High"), list(res_NH, "Normal_vs_High"))) {
@@ -128,6 +132,20 @@ core_genes <- intersect(rownames(sig_MH), rownames(sig_NH))
 core_strict <- intersect(rownames(strict_MH), rownames(strict_NH))
 cat("Core DEGs (broad, shared):", length(core_genes), "\n")
 cat("Core DEGs (strict, shared):", length(core_strict), "\n")
+
+# Write diagnostic result tables (also committed in data/csv/)
+write.csv(as.data.frame(results(dds, contrast = c("condition", "Medium", "High"))),
+          "data/csv/DESeq2_M_vs_H_results.csv")
+write.csv(as.data.frame(results(dds, contrast = c("condition", "Normal", "High"))),
+          "data/csv/DESeq2_N_vs_H_results.csv")
+write.csv(as.data.frame(res_MH), "data/csv/DESeq2_Medium_vs_High_shrunken.csv")
+write.csv(as.data.frame(res_NH), "data/csv/DESeq2_Normal_vs_High_shrunken.csv")
+write.csv(as.data.frame(strict_MH), "data/csv/SIGNIFICANT_DEGs_Medium_vs_High.csv")
+write.csv(as.data.frame(strict_NH), "data/csv/SIGNIFICANT_DEGs_Normal_vs_High.csv")
+write.csv(as.data.frame(sig_MH), "data/csv/ALL_SIGNIFICANT_DEGs_M_vs_H.csv")
+write.csv(as.data.frame(sig_NH), "data/csv/ALL_SIGNIFICANT_DEGs_N_vs_H.csv")
+write.csv(data.frame(Core_Genes = core_genes), "data/csv/Core_Shared_DEGs.csv",
+          row.names = FALSE)
 
 # Figure 2A/2B: Volcano Plots
 plot_volcano <- function(res, title, color) {
@@ -210,7 +228,10 @@ pathways <- split(kegg_sets$gene_symbol, kegg_sets$gs_name)
 gsea_kegg <- as.data.frame(fgsea::fgsea(pathways = pathways, stats = ranked,
                                         minSize = 15, maxSize = 500, nPermSimple = 1000))
 gsea_kegg <- gsea_kegg[order(gsea_kegg$padj), ]
-write.csv(gsea_kegg, "data/csv/GSEA_KEGG_results.csv", row.names = FALSE)
+# `leadingEdge` is a list-column; flatten it to a string for CSV export
+gsea_out <- gsea_kegg
+gsea_out$leadingEdge <- vapply(gsea_out$leadingEdge, paste, character(1), collapse = ";")
+write.csv(gsea_out, "data/csv/GSEA_KEGG_results.csv", row.names = FALSE)
 
 gsea_sig <- head(subset(gsea_kegg, padj < 0.05), 15)
 ggsave("figures/03_Enrichment/KEGG_GSEA_dotplot.jpg",
@@ -260,14 +281,20 @@ dev.off()
 # 9. TRANSCRIPTION FACTOR ACTIVITY INFERENCE — Figure 10
 # ------------------------------------------------------------------------------
 # CollecTRI regulon + per-sample ULM, followed by a Medium-vs-High t-test.
-net <- get_collectri(organism = "human", split_complexes = FALSE)
+# CollecTRI regulon (DOI 10.5281/zenodo.8192729), fetched directly so the
+# pipeline does not depend on the OmnipathR/decoupleR version pairing.
+collectri_csv <- "https://zenodo.org/records/8192729/files/CollecTRI_regulons.csv?download=1"
+net <- read.csv(collectri_csv, check.names = FALSE)
+net <- unique(dplyr::select(net, source, target, weight))
 
 expr <- assay(vsd)                                   # genes x samples
 tf_acts <- run_ulm(mat = expr, network = net,
                    .source = "source", .target = "target",
                    .mor = "weight", minsize = 5)
-# tf_acts: one score per TF per sample (column `condition`)
-wide <- pivot_wider(as.data.frame(tf_acts), names_from = condition, values_from = score)
+# tf_acts: one score per TF per sample (column `condition`); drop the extra
+# statistic/p-value columns so the pivot produces one row per TF
+tf_acts <- dplyr::select(as.data.frame(tf_acts), source, condition, score)
+wide <- pivot_wider(tf_acts, names_from = condition, values_from = score)
 wide <- as.data.frame(wide); rownames(wide) <- wide$source
 m_cols <- grep("^M", colnames(wide), value = TRUE)
 h_cols <- grep("^H", colnames(wide), value = TRUE)
