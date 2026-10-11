@@ -8,3 +8,6 @@
 .DS_Store
 Thumbs.db
 *.swp
+
+# Public GEO cache (downloaded by R/00_download_data.R; regenerated on demand)
+data/cache/

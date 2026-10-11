@@ -36,6 +36,10 @@ suppressPackageStartupMessages({
 
 set.seed(42)
 
+# STRING v12.5 and Zenodo downloads can exceed R's 60 s download timeout;
+# raise it so the network/TF stages are reproducible on slow connections.
+options(timeout = 900)
+
 dir.create("figures/01_QC",          showWarnings = FALSE, recursive = TRUE)
 dir.create("figures/02_DEG",         showWarnings = FALSE, recursive = TRUE)
 dir.create("figures/03_Enrichment",  showWarnings = FALSE, recursive = TRUE)
@@ -48,8 +52,21 @@ dir.create("figures/05_TF",          showWarnings = FALSE, recursive = TRUE)
 # Load raw RNA-seq count data (GSE307956). Columns are the nine samples:
 #   High glucose (H1-H3), Medium glucose (M1-M3), Normal glucose (N1-N3)
 # Glucose concentrations: High = 30 mM, Medium = 15 mM, Normal = 5.5 mM.
+# Raw counts are keyed by Entrez gene id (unique and stable), built directly
+# from the public GSE307956 supplementary core table by R/00_download_data.R.
+# A separate annotation file carries the official gene symbols, mapped to
+# Ensembl-style ids only where downstream tools require symbols.
 counts <- read.csv("data/GSE307956_raw_count_matrix.csv",
                    row.names = 1, check.names = FALSE)
+annot <- read.csv("data/GSE307956_gene_annotation.csv",
+                  row.names = 1, check.names = FALSE)
+
+# Entrez gene id -> official gene symbol (drops ids without a symbol)
+sym_of <- function(ids) {
+  s <- annot[ids, "gene_symbol"]
+  s <- s[!is.na(s) & s != ""]
+  unique(s)
+}
 
 # Map sample labels (H/M/N) to the biological condition levels
 lv <- c("N" = "Normal", "M" = "Medium", "H" = "High")
@@ -173,9 +190,11 @@ vst_matrix <- assay(vsd)
 vst_zscore <- t(apply(vst_matrix, 1, function(x) (x - mean(x)) / sd(x)))
 
 top10 <- head(core_genes[order(res_MH[core_genes, "padj"])], 10)
+top10_sym <- annot[top10, "gene_symbol"]
 pheatmap(vst_zscore[top10, ],
          scale = "row",
          show_colnames = TRUE,
+         labels_row = top10_sym,
          main = "Top 10 Core DEGs — Row-normalised VST Expression",
          filename = "figures/02_DEG/Core_Gene_Heatmap.jpeg",
          width = 6, height = 5,
@@ -186,7 +205,7 @@ pheatmap(vst_zscore[top10, ],
 # ------------------------------------------------------------------------------
 # 6a. Over-representation analysis (ORA) via Enrichr
 dbs <- c("KEGG_2021_Human", "GO_Biological_Process_2021")
-enr <- enrichr(core_genes, dbs)
+enr <- enrichr(sym_of(core_genes), dbs)
 kegg_ora_df <- enr$KEGG_2021_Human
 go_bp_df    <- enr$GO_Biological_Process_2021
 write.csv(kegg_ora_df, "data/csv/KEGG_enrichment_results.csv", row.names = FALSE)
@@ -213,10 +232,13 @@ ggsave("figures/03_Enrichment/GO_dotplot_FINAL.jpg",
        width = 8, height = 6, dpi = 200)
 
 # 6b. Gene Set Enrichment Analysis (GSEA) — genes ranked by log2 fold change
-# (Medium vs High). Negative ranks = suppressed under high glucose.
+# (Medium vs High), keyed by gene symbol for matching against MSigDB. Negative
+# ranks = suppressed under high glucose.
 rank_stat <- function(res) {
   s <- res$log2FoldChange
-  names(s) <- rownames(res); s <- s[is.finite(s)]
+  names(s) <- annot[rownames(res), "gene_symbol"]
+  s <- s[!is.na(names(s)) & !duplicated(names(s))]
+  s <- s[is.finite(s)]
   sort(s, decreasing = TRUE)
 }
 ranked <- rank_stat(res_MH)
@@ -250,7 +272,8 @@ ggsave("figures/03_Enrichment/GSEA_ridgeplot.jpg",
 # ------------------------------------------------------------------------------
 # 7. TOP-RANKED GENE EXPRESSION (LOC102723728) — Figure 4
 # ------------------------------------------------------------------------------
-top_gene <- rownames(res_MH)[which.min(res_MH$padj)]   # LOC102723728
+top_gene <- rownames(res_MH)[which.min(res_MH$padj)]   # LOC102723728 (Entrez 102723728)
+top_sym   <- annot[top_gene, "gene_symbol"]
 top_expr <- data.frame(
   Expression = assay(vsd)[top_gene, ],
   Condition  = col_data$condition
@@ -261,16 +284,17 @@ p_gene <- ggplot(top_expr, aes(Condition, Expression, fill = Condition)) +
   theme_classic() +
   scale_fill_manual(values = c("High" = "salmon", "Medium" = "green3",
                                "Normal" = "steelblue")) +
-  ggtitle(paste0(top_gene, " — Normalised Expression Across Glucose Conditions")) +
+  ggtitle(paste0(top_sym, " — Normalised Expression Across Glucose Conditions")) +
   ylab("VST-normalised Expression")
 ggsave("figures/02_DEG/Top_Gene_Expression.jpeg", p_gene, width = 6, height = 5, dpi = 200)
 
 # ------------------------------------------------------------------------------
 # 8. PPI NETWORK ANALYSIS (STRINGdb) — Figure 8
 # ------------------------------------------------------------------------------
+dir.create("cache/stringdb", showWarnings = FALSE, recursive = TRUE)
 string_db <- STRINGdb$new(version = "12.5", species = 9606,
-                          score_threshold = 400, input_directory = ".")
-gene_df <- data.frame(SYMBOL = core_strict)
+                          score_threshold = 400, input_directory = "cache/stringdb")
+gene_df <- data.frame(SYMBOL = sym_of(core_strict))
 gene_mapped <- string_db$map(gene_df, "SYMBOL", removeUnmappedRows = TRUE)
 hits <- gene_mapped$STRING_id
 png("figures/04_Networks/STRING_global_network.jpg", width = 1400, height = 1200, res = 150)
@@ -282,22 +306,38 @@ dev.off()
 # ------------------------------------------------------------------------------
 # CollecTRI regulon + per-sample ULM, followed by a Medium-vs-High t-test.
 # CollecTRI regulon (DOI 10.5281/zenodo.8192729), fetched directly so the
-# pipeline does not depend on the OmnipathR/decoupleR version pairing.
-collectri_csv <- "https://zenodo.org/records/8192729/files/CollecTRI_regulons.csv?download=1"
-net <- read.csv(collectri_csv, check.names = FALSE)
+# pipeline does not depend on the OmnipathR/decoupleR version pairing. The
+# file is cached under data/csv/ so the run is reproducible offline.
+collectri_url <- "https://zenodo.org/records/8192729/files/CollecTRI_regulons.csv?download=1"
+dir.create("cache", showWarnings = FALSE, recursive = TRUE)
+collectri_path <- "cache/CollecTRI_regulons.csv"
+if (!file.exists(collectri_path)) {
+  download.file(collectri_url, collectri_path, quiet = TRUE, mode = "wb")
+}
+net <- read.csv(collectri_path, check.names = FALSE)
 net <- unique(dplyr::select(net, source, target, weight))
 
-expr <- assay(vsd)                                   # genes x samples
-tf_acts <- run_ulm(mat = expr, network = net,
+expr_sym <- assay(vsd)
+sym_row <- annot[rownames(expr_sym), "gene_symbol"]
+sym_keep <- !is.na(sym_row) & !duplicated(sym_row)
+expr_sym <- expr_sym[sym_keep, ]
+rownames(expr_sym) <- sym_row[sym_keep]               # gene symbols x samples
+
+tf_acts <- run_ulm(mat = expr_sym, network = net,
                    .source = "source", .target = "target",
                    .mor = "weight", minsize = 5)
 # tf_acts: one score per TF per sample (column `condition`); drop the extra
 # statistic/p-value columns so the pivot produces one row per TF
 tf_acts <- dplyr::select(as.data.frame(tf_acts), source, condition, score)
 wide <- pivot_wider(tf_acts, names_from = condition, values_from = score)
-wide <- as.data.frame(wide); rownames(wide) <- wide$source
-m_cols <- grep("^M", colnames(wide), value = TRUE)
-h_cols <- grep("^H", colnames(wide), value = TRUE)
+wide <- as.data.frame(wide)
+rownames(wide) <- wide$source
+# Map pivot columns (sample ids) back to the declared glucose groups instead of
+# guessing prefixes, so this is robust to any sample-id naming scheme.
+samp_cond <- setNames(as.character(col_data$condition), rownames(col_data))
+use_cols <- intersect(colnames(wide), names(samp_cond))
+m_cols <- use_cols[samp_cond[use_cols] == "Medium"]
+h_cols <- use_cols[samp_cond[use_cols] == "High"]
 tf_tt <- data.frame(
   source = wide$source,
   delta  = rowMeans(wide[, m_cols, drop = FALSE]) - rowMeans(wide[, h_cols, drop = FALSE]),
@@ -325,14 +365,22 @@ ggsave("figures/05_TF/TF_activity.jpg", p_tf, width = 7, height = 9, dpi = 200)
 validation_genes <- c("RPS15", "RPS19", "RPL13")
 cat("Validation genes (concordant in human DKD tissue):",
     paste(validation_genes, collapse = ", "), "\n")
-# If GEOquery/limma are available, differential expression of the validation
-# genes can be computed from GSE30528 (diabetic kidney disease vs control):
-if (requireNamespace("GEOquery", quietly = TRUE) &&
-    requireNamespace("limma", quietly = TRUE)) {
-  gse <- GEOquery::getGEO("GSE30528", GSEMatrix = TRUE)
-  eset <- gse[[1]]
-  ex <- Biobase::exprs(eset)
-  ## further processing depends on the locally cached series file; see README.
+# If GEOquery is available, differential expression of the validation genes can
+# be computed from GSE30528 (diabetic kidney disease vs control). Wrapped in
+# tryCatch because the series may not be public/downloadable from this host.
+if (requireNamespace("GEOquery", quietly = TRUE)) {
+  fetched <- tryCatch(
+    GEOquery::getGEO("GSE30528", GSEMatrix = TRUE),
+    error = function(e) NULL
+  )
+  if (!is.null(fetched)) {
+    eset <- fetched[[1]]
+    ex <- Biobase::exprs(eset)
+    ## further processing depends on the locally cached series file; see README.
+  } else {
+    message("GSE30528 series not retrievable from this host; ",
+            "external validation step skipped (see README).")
+  }
 }
 
 # ==============================================================================

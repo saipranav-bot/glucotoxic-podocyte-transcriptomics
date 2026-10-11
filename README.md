@@ -12,7 +12,9 @@ lower-glucose condition).
 
 ## Pipeline
 
-`R/glucotoxic_podocyte_analysis.R` runs end-to-end:
+`R/00_download_data.R` downloads the public GSE307956 supplementary core table
+from GEO and writes the Entrez-keyed count matrix + gene annotation used below.
+`R/glucotoxic_podocyte_analysis.R` then runs end-to-end:
 
 1. DESeq2 differential expression (Medium vs High, Normal vs High) with apeglm
    shrinkage; broad (|log2FC| > 0.5) and strict (|log2FC| > 1.0) thresholds.
@@ -28,10 +30,12 @@ lower-glucose condition).
 glucotoxic-podocyte-transcriptomics/
 │
 ├── R/
+│   ├── 00_download_data.R
 │   └── glucotoxic_podocyte_analysis.R
 │
 ├── data/
 │   ├── GSE307956_raw_count_matrix.csv
+│   ├── GSE307956_gene_annotation.csv
 │   └── csv/
 │       ├── ALL_SIGNIFICANT_DEGs_M_vs_H.csv
 │       ├── ALL_SIGNIFICANT_DEGs_N_vs_H.csv
