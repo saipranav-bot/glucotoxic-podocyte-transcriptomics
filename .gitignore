@@ -11,3 +11,9 @@ Thumbs.db
 
 # Public GEO cache (downloaded by R/00_download_data.R; regenerated on demand)
 data/cache/
+
+# R default plot device output
+/Rplots.pdf
+
+# Top-level pipeline cache (CollecTRI + STRING downloads; regenerated on demand)
+/cache/

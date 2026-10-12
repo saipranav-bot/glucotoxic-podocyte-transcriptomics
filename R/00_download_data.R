@@ -13,7 +13,7 @@
 # ==============================================================================
 
 url <- paste0(
-  "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE307nnn/GSE307956/suppl/",
+  "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE307956/suppl/",
   "GSE307956_core_table_gene.txt.gz"
 )
 
